@@ -460,15 +460,58 @@ fn normalize_plain_text_layout(text: &str) -> String {
 }
 
 fn decode_basic_html_entities(text: &str) -> String {
-    text.replace("&nbsp;", " ")
-        .replace("&#160;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#34;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
+    static HTML_ENTITY_RE: OnceLock<Regex> = OnceLock::new();
+
+    // Decode exactly one HTML entity layer. Chained replacements would turn
+    // visible text such as "&#32;" (represented by HTML as "&amp;#32;") into a
+    // space by decoding the newly-created entity a second time.
+    HTML_ENTITY_RE
+        .get_or_init(|| {
+            Regex::new(r"(?i)&(?:nbsp|amp|lt|gt|quot|apos|#x[0-9a-f]+|#[0-9]+);").unwrap()
+        })
+        .replace_all(text, |captures: &regex::Captures| {
+            let entity = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
+            let lower = entity.to_ascii_lowercase();
+
+            match lower.as_str() {
+                "&nbsp;" => " ".to_string(),
+                "&amp;" => "&".to_string(),
+                "&lt;" => "<".to_string(),
+                "&gt;" => ">".to_string(),
+                "&quot;" => "\"".to_string(),
+                "&apos;" => "'".to_string(),
+                _ => {
+                    let digits = lower
+                        .strip_prefix("&#x")
+                        .and_then(|value| value.strip_suffix(';'));
+                    let value = if let Some(hex) = digits {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        lower
+                            .strip_prefix("&#")
+                            .and_then(|value| value.strip_suffix(';'))
+                            .and_then(|decimal| decimal.parse::<u32>().ok())
+                    };
+
+                    match value {
+                        Some(160) => " ".to_string(),
+                        Some(value) => char::from_u32(value)
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_else(|| entity.to_string()),
+                        None => entity.to_string(),
+                    }
+                }
+            }
+        })
+        .into_owned()
+}
+
+fn contains_numeric_html_entity_literal(text: &str) -> bool {
+    static NUMERIC_ENTITY_RE: OnceLock<Regex> = OnceLock::new();
+
+    NUMERIC_ENTITY_RE
+        .get_or_init(|| Regex::new(r"(?i)&#(?:x[0-9a-f]+|[0-9]+);").unwrap())
+        .is_match(text)
 }
 
 fn is_office_style_definition_text(text: &str) -> bool {
@@ -1032,6 +1075,17 @@ pub fn derive_rich_text_content(content: &str, html_content: Option<&str>) -> St
         {
             return layout_plain;
         }
+
+        // Some clipboard producers expose visible text like "&#32;" verbatim in
+        // the plain-text flavor but fail to escape it as "&amp;#32;" in HTML.
+        // When decoding the plain text once produces the same visible HTML text,
+        // the plain flavor disambiguates the sequence as intentional literal text.
+        if contains_numeric_html_entity_literal(&sanitized_plain)
+            && collapse_preview_whitespace(&decode_basic_html_entities(&sanitized_plain))
+                == collapse_preview_whitespace(&text)
+        {
+            return sanitized_plain;
+        }
         return text;
     }
 
@@ -1550,6 +1604,52 @@ mod tests {
         let content = derive_rich_text_content("A\tB\nC\tD", Some(html));
 
         assert_eq!(content, "A\tB\nC\tD");
+    }
+
+    #[test]
+    fn rich_text_content_decodes_decimal_space_entity() {
+        let html = "<span>First&#32;Second</span>";
+
+        let content = derive_rich_text_content("First Second", Some(html));
+
+        assert_eq!(content, "First Second");
+        assert!(!content.contains("&#32;"));
+    }
+
+    #[test]
+    fn rich_text_content_decodes_hex_and_unicode_numeric_entities() {
+        let html = "<span>A&#x20;B&#20013;</span>";
+
+        let content = derive_rich_text_content("A B中", Some(html));
+
+        assert_eq!(content, "A B中");
+    }
+
+    #[test]
+    fn rich_text_content_does_not_double_decode_visible_numeric_entities() {
+        let html = "<span>&amp;#32; &amp;#x20;</span>";
+
+        let content = derive_rich_text_content("&#32; &#x20;", Some(html));
+
+        assert_eq!(content, "&#32; &#x20;");
+    }
+
+    #[test]
+    fn rich_text_content_uses_plain_text_to_disambiguate_unescaped_entity_literal() {
+        let html = "<span>First&#32;Second</span>";
+
+        let content = derive_rich_text_content("First&#32;Second", Some(html));
+
+        assert_eq!(content, "First&#32;Second");
+    }
+
+    #[test]
+    fn rich_text_content_keeps_invalid_numeric_entity_literal() {
+        let html = "<span>Value:&#99999999;</span>";
+
+        let content = derive_rich_text_content("Value:&#99999999;", Some(html));
+
+        assert_eq!(content, "Value:&#99999999;");
     }
 
     #[test]
